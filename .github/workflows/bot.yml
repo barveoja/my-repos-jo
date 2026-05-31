@@ -1,0 +1,91 @@
+name: bid.cars bot
+
+on:
+  schedule:
+    # ~Every 15 min, offset off the hour to dodge peak-load delays.
+    # GitHub cron is best-effort: expect occasional 5–30 min drift.
+    - cron: "8,23,38,53 * * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: bidcars-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # only to commit the dedupe state file
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Chromium (playwright mode only)
+        if: ${{ vars.SCRAPE_MODE == 'playwright' }}
+        run: npx playwright install --with-deps chromium
+
+      # Optional: route the scrape through a WireGuard VPN if GitHub's IPs are
+      # blocked. Toggle with the USE_VPN variable; config lives in a secret.
+      # Brought up AFTER the (large) Chromium download so that stays on the fast IP.
+      - name: Connect WireGuard VPN
+        if: ${{ vars.USE_VPN == 'true' }}
+        env:
+          WG_CONF: ${{ secrets.WIREGUARD_CONFIG }}
+        run: |
+          echo "IP before VPN: $(curl -s --max-time 15 https://api.ipify.org || echo unknown)"
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq wireguard-tools openresolv
+          umask 077
+          printf '%s\n' "$WG_CONF" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          sudo wg-quick up wg0
+          echo "IP after VPN:  $(curl -s --max-time 15 https://api.ipify.org || echo unknown)"
+
+      - name: Run bot
+        env:
+          # secrets
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHANNEL_ID: ${{ secrets.TG_CHANNEL_ID }}
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          TG_ALERT_CHAT: ${{ secrets.TG_ALERT_CHAT }}
+          BIDCARS_COOKIES: ${{ secrets.BIDCARS_COOKIES }}
+          # variables
+          SEARCH_URLS: ${{ vars.SEARCH_URLS }}
+          SCRAPE_MODE: ${{ vars.SCRAPE_MODE }}
+          APIFY_ACTOR: ${{ vars.APIFY_ACTOR }}
+          RESULTS_PER_SOURCE: ${{ vars.RESULTS_PER_SOURCE }}
+          MAX_POSTS_PER_RUN: ${{ vars.MAX_POSTS_PER_RUN }}
+          POST_DELAY_MS: ${{ vars.POST_DELAY_MS }}
+          MAX_PHOTOS: ${{ vars.MAX_PHOTOS }}
+          DEDUPE_DAYS: ${{ vars.DEDUPE_DAYS }}
+          TRUST_SOURCE_FILTER: ${{ vars.TRUST_SOURCE_FILTER }}
+          PHOTO_MODE: ${{ vars.PHOTO_MODE }}
+        run: node bot.mjs
+
+      # Drop the tunnel before the git push so repo writes use GitHub's normal IP.
+      - name: Disconnect WireGuard VPN
+        if: ${{ always() && vars.USE_VPN == 'true' }}
+        run: sudo wg-quick down wg0 || true
+
+      - name: Persist state + heartbeat
+        if: ${{ always() }}   # keeps repo active (anti auto-disable) even on a failed run
+        run: |
+          mkdir -p state
+          date -u +%F > state/heartbeat.txt
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add state
+          if git diff --cached --quiet; then
+            echo "No state change — nothing to commit."
+          else
+            git pull --rebase --autostash || true
+            git commit -m "chore: dedupe state $(date -u +%FT%TZ)"
+            git push
+          fi
