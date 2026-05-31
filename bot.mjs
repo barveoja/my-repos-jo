@@ -263,12 +263,31 @@ async function viaPlaywright(searchUrl) {
         const isSoldCard = /\bsold\b/i.test(priceText);
         const toNum = (s) => (s ? Number(s.replace(/[^\d]/g, "")) : null);
 
-        const photoRoot = wrap?.parentElement || wrap;
-        const imgs = photoRoot
-          ? [...photoRoot.querySelectorAll("img")]
-              .map((i) => i.getAttribute("src") || i.getAttribute("data-src") || i.getAttribute("data-original") || (i.getAttribute("srcset") || "").trim().split(/\s+/)[0])
-              .filter(realPhoto)
-          : [];
+        // Photos: bid.cars uses a lazy slider — scan <img> attrs, srcset,
+        // data-* lazy URLs, and CSS background-image, not just <img src>.
+        const photoRoot = wrap?.closest("li, .col, .row, [class*='item']")?.parentElement || wrap?.parentElement || wrap;
+        const found = new Set();
+        if (photoRoot) {
+          for (const el of photoRoot.querySelectorAll("*")) {
+            if (el.tagName === "IMG") {
+              for (const a of ["src", "data-src", "data-original", "data-lazy", "data-flickity-lazyload", "data-echo"]) {
+                const v = el.getAttribute(a);
+                if (v) found.add(v);
+              }
+              const ss = el.getAttribute("srcset");
+              if (ss) ss.split(",").forEach((p) => found.add(p.trim().split(/\s+/)[0]));
+            }
+            const st = el.getAttribute("style");
+            if (st && /background/i.test(st)) {
+              const m = st.match(/url\((['"]?)(.*?)\1\)/i);
+              if (m && m[2]) found.add(m[2]);
+            }
+            for (const at of el.attributes || []) {
+              if (/^data-/.test(at.name) && /\.(jpe?g|png|webp)/i.test(at.value)) found.add(at.value);
+            }
+          }
+        }
+        const imgs = [...found].map((u) => (u.startsWith("//") ? "https:" + u : u)).filter(realPhoto);
 
         // title → year/make/model/series
         const tm = titleText.match(/^(\d{4})\s+([A-Za-z-]+)\s+(.+)$/);
@@ -301,10 +320,22 @@ async function viaPlaywright(searchUrl) {
           images: [...new Set(imgs)],
         };
         if (!dbg) {
-          const allImgs = photoRoot
-            ? [...photoRoot.querySelectorAll("img")].map((i) => i.getAttribute("src") || i.getAttribute("data-src") || "").filter(Boolean)
-            : [];
-          dbg = { priceText: priceText.slice(0, 160), photoCount: card.images.length, allImgs: allImgs.slice(0, 12) };
+          const sliderEl = photoRoot?.querySelector("[class*='slider'],[class*='carousel'],[class*='swiper'],[class*='gallery'],[class*='photo'],[class*='image'],figure");
+          let imgHtml = sliderEl ? sliderEl.outerHTML.slice(0, 1500) : null;
+          // also surface any element whose data-* attrs reference a jpg/png/webp
+          let dataAttrHit = null;
+          if (photoRoot) {
+            for (const el of photoRoot.querySelectorAll("*")) {
+              for (const at of el.attributes || []) {
+                if (/\.(jpe?g|png|webp)/i.test(at.value) && !/\/(icons|img\/upd|images)\//i.test(at.value)) {
+                  dataAttrHit = `${el.tagName}.${el.className} [${at.name}]=${at.value.slice(0, 120)}`;
+                  break;
+                }
+              }
+              if (dataAttrHit) break;
+            }
+          }
+          dbg = { photoCount: card.images.length, firstPhoto: card.images[0] || null, dataAttrHit, imgHtml };
         }
         cards.push(card);
       }
