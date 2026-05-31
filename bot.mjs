@@ -204,54 +204,113 @@ async function viaPlaywright(searchUrl) {
     });
     if (blob) { const l = findLots(blob); if (l.length) return l.slice(0, CFG.resultsPerSource); }
 
-    // Fallback 2: bid.cars renders results server-side. The `data-lot` attribute
-    // lives on the "favorite" heart button INSIDE each card, so we anchor on that
-    // and walk up to the enclosing card to read title/price/image/link.
+    // Fallback 2: bid.cars renders results server-side. Parse the real card.
     const result = await page.evaluate(() => {
-      const hearts = [...document.querySelectorAll("a[data-lot]")];
-      const isLotHref = (h) => h && h !== "#" && !h.endsWith("#") && /lot|vin|\/\d{5,}/i.test(h);
-      const findCard = (heart) => {
-        let n = heart;
-        for (let i = 0; i < 9 && n && n.parentElement; i++) {
-          n = n.parentElement;
-          const hasImg = !!n.querySelector("img");
-          const hasLotLink = [...n.querySelectorAll("a")].some((a) => isLotHref(a.getAttribute("href")));
-          if (hasImg && hasLotLink) return n;
-        }
-        return heart.parentElement;
-      };
+      const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const afterLabel = (s) => clean((s || "").replace(/^[^:]*:/, "")); // drop "Label: "
+      const realPhoto = (u) =>
+        u && /\.(jpe?g|png|webp)(\?|$)/i.test(u) && !/\/(icons|img\/upd|images)\//i.test(u) && !/\.svg/i.test(u);
+
+      const links = [...document.querySelectorAll('a.item-title[href*="/lot/"], a[href*="/en/lot/"]')];
       const seen = new Set();
       const cards = [];
-      let debugHtml = null;
-      for (const heart of hearts) {
-        const lot = heart.getAttribute("data-lot");
-        if (!lot || seen.has(lot)) continue;
-        seen.add(lot);
-        const card = findCard(heart);
-        if (!debugHtml && card) debugHtml = card.outerHTML.slice(0, 3000);
-        const text = (sel) => card?.querySelector(sel)?.textContent?.trim() || null;
-        const lotLink = card
-          ? [...card.querySelectorAll("a")].find((a) => isLotHref(a.getAttribute("href")))
-          : null;
-        const imgs = card
-          ? [...card.querySelectorAll("img")]
-              .map((i) =>
-                i.getAttribute("src") || i.getAttribute("data-src") || i.getAttribute("data-original") ||
-                (i.getAttribute("srcset") || "").trim().split(/\s+/)[0])
-              .filter((u) => u && /^https?:/.test(u))
+      let dbg = null;
+
+      for (const link of links) {
+        const href = link.getAttribute("href") || "";
+        const mId = href.match(/\/lot\/([0-9-]+)/i);
+        const lotId = mId ? mId[1] : null;
+        if (!lotId || seen.has(lotId)) continue;
+        // pick the title-looking link (has text), skip image-only links
+        const titleText = clean(link.textContent);
+        if (!titleText) continue;
+        seen.add(lotId);
+
+        const wrap = link.closest(".wrapper") || link.closest("li, .item, div");
+        const q = (sel) => wrap?.querySelector(sel);
+        const qt = (sel) => clean(q(sel)?.textContent);
+
+        // VIN + lot are two .vin_title spans
+        const vinEls = wrap ? [...wrap.querySelectorAll(".vin_title")].map((e) => clean(e.textContent)) : [];
+        const vin = vinEls.find((v) => /^[A-HJ-NPR-Z0-9]{11,17}$/i.test(v)) || vinEls[0] || null;
+
+        // spec icons (alt / tooltip text) + engine text
+        const specEls = wrap ? [...wrap.querySelectorAll(".specs > span")] : [];
+        const specTexts = specEls.map((s) => ({
+          tip: s.getAttribute("data-original-title") || s.querySelector("img")?.getAttribute("alt") || "",
+          txt: clean(s.textContent),
+        }));
+        const findSpec = (re) => specTexts.find((s) => re.test(s.tip))?.tip || null;
+        const engine = clean(specTexts.filter((s) => /engine/i.test(s.tip) && s.txt).map((s) => s.txt).join(" ")) || null;
+
+        // list items
+        const liText = (cls) => {
+          const el = wrap?.querySelector(cls);
+          return el ? afterLabel(el.textContent) : null;
+        };
+        let damage = null, dmgEl = wrap ? [...wrap.querySelectorAll("li")].find((li) => /damage/i.test(li.textContent)) : null;
+        if (dmgEl) damage = afterLabel(dmgEl.textContent);
+        const [primaryDamage, secondaryDamage] = (damage || "").split("|").map((s) => clean(s));
+
+        const doc = liText(".doc_desc"); // "Clear (New Jersey)"
+        const docM = (doc || "").match(/^(.*?)\s*\(([^)]+)\)\s*$/);
+
+        // price / status — parse carefully, no digit-mashing
+        const priceText = clean((wrap?.querySelector(".item-price") || wrap)?.textContent || "");
+        const soldM = priceText.match(/(?:sold(?:\s*for)?|final\s*bid|purchase\s*price)\D{0,8}\$([\d,]+)/i);
+        const bidM = priceText.match(/current\s*bid\D{0,8}\$([\d,]+)/i);
+        const estM = priceText.match(/\$[\d,]+\s*-\s*\$[\d,]+/);
+        const isSoldCard = /\bsold\b/i.test(priceText);
+        const toNum = (s) => (s ? Number(s.replace(/[^\d]/g, "")) : null);
+
+        const photoRoot = wrap?.parentElement || wrap;
+        const imgs = photoRoot
+          ? [...photoRoot.querySelectorAll("img")]
+              .map((i) => i.getAttribute("src") || i.getAttribute("data-src") || i.getAttribute("data-original") || (i.getAttribute("srcset") || "").trim().split(/\s+/)[0])
+              .filter(realPhoto)
           : [];
-        cards.push({
-          lotId: lot,
-          title: text("h1,h2,h3,h4,.title,.name,.lot-title") || lotLink?.textContent?.trim() || null,
-          priceText: text("[class*='price'],[class*='bid'],[class*='sold'],[class*='amount']"),
-          allText: card ? card.innerText.replace(/\s+/g, " ").trim().slice(0, 400) : null,
-          url: lotLink?.href || null,
+
+        // title → year/make/model/series
+        const tm = titleText.match(/^(\d{4})\s+([A-Za-z-]+)\s+(.+)$/);
+        const year = tm ? tm[1] : null;
+        const make = tm ? tm[2] : null;
+        const rest = tm ? tm[3] : titleText;
+        const [model, series] = rest.split(",").map((s) => clean(s));
+
+        const card = {
+          lotId, vin, url: link.href, title: titleText,
+          year, make, model, series,
+          auction: qt(".item-seller"),
+          seller: liText(".seller_desc"),
+          location: liText(".loc_desc"),
+          odometerText: liText(".odo_desc"),
+          transmission: findSpec(/automatic|manual|cvt/i),
+          fuel: findSpec(/gasoline|diesel|hybrid|electric|petrol|gas/i),
+          drive: findSpec(/wheel drive|awd|fwd|rwd|4wd/i),
+          keys: findSpec(/key/i) ? "Yes" : null,
+          engine,
+          primaryDamage: primaryDamage || null,
+          secondaryDamage: secondaryDamage || null,
+          titleType: docM ? clean(docM[1]) : doc,
+          titleState: docM ? clean(docM[2]) : null,
+          runDrive: liText(".status_item"),
+          status: isSoldCard ? "Sold" : "Active",
+          salePrice: soldM ? toNum(soldM[1]) : null,
+          currentBid: bidM ? toNum(bidM[1]) : null,
+          estimate: estM ? estM[0] : null,
           images: [...new Set(imgs)],
-        });
+        };
+        if (!dbg) {
+          const allImgs = photoRoot
+            ? [...photoRoot.querySelectorAll("img")].map((i) => i.getAttribute("src") || i.getAttribute("data-src") || "").filter(Boolean)
+            : [];
+          dbg = { priceText: priceText.slice(0, 160), photoCount: card.images.length, allImgs: allImgs.slice(0, 12) };
+        }
+        cards.push(card);
       }
-      return { cards, debugHtml };
+      return { cards, dbg };
     });
-    console.log("DEBUG card container HTML:", JSON.stringify(result.debugHtml));
+    console.log("DEBUG parse sample:", JSON.stringify(result.dbg));
     if (!result.cards.length)
       console.warn("Playwright found 0 lots — page may be challenged/blocked on this IP (see README).");
     return result.cards;
@@ -330,18 +389,22 @@ function normalizeLot(r) {
   if (!id) return null;
 
   const status = String(pick(r, ["status", "auctionStatus", "saleStatus", "lotStatus"]) || "").toLowerCase();
-  const salePrice = num(pick(r, ["salePrice", "soldPrice", "finalBid", "purchasePrice", "price", "currentBid", "highBid", "priceText"]));
+  const salePrice = num(pick(r, ["salePrice", "soldPrice", "finalBid", "purchasePrice"]));
+  const currentBid = num(pick(r, ["currentBid", "highBid"]));
   const soldRaw = pick(r, ["saleDate", "soldDate", "sale_date", "auctionDate", "dateSold", "saleDateTime"]);
   const soldAtTs = toTs(soldRaw);
-  const isSold = /sold|purchas/.test(status) || (salePrice > 0 && soldAtTs > 0);
+  const isSold = /sold|purchas/.test(status) || salePrice > 0;
 
   return {
     id,
     isSold,
     soldAtTs,
-    title: String(pick(r, ["title", "name", "vehicleTitle"]) || (r.allText ? r.allText.slice(0, 80) : "")).trim() || null,
+    title: String(pick(r, ["title", "name", "vehicleTitle"]) || "").trim() || null,
     soldAtText: typeof soldRaw === "string" ? soldRaw : soldAtTs ? new Date(soldAtTs).toISOString().slice(0, 10) : null,
     salePrice,
+    currentBid,
+    estimate: pick(r, ["estimate", "estimateRange"]),
+    saleStatus: pick(r, ["status", "saleStatus"]),
     currency: pick(r, ["currency", "currencyCode"]) || "USD",
     estRetail: num(pick(r, ["estimatedRetailValue", "estRetailValue", "acv", "retailValue", "estimatedValue"])),
 
@@ -360,6 +423,7 @@ function normalizeLot(r) {
     colorInt: pick(r, ["interiorColor", "intColor", "trimColor"]),
 
     odometer: pick(r, ["odometer", "mileage", "miles", "odometerValue"]),
+    odometerText: pick(r, ["odometerText"]),
     odometerUnit: pick(r, ["odometerUnit", "mileageUnit"]) || "mi",
     odometerStatus: pick(r, ["odometerStatus", "odometerBrand", "mileageStatus"]),
 
@@ -406,21 +470,24 @@ function buildCaption(l) {
   L.push(`🚗 <b>${esc(head)}</b>`);
   if (l.body) L.push(`<i>${esc(l.body)}</i>`);
 
-  // sale line
+  // sale / bid line
   const sale = [];
   if (l.salePrice > 0) sale.push(`💰 <b>Sold ${money(l.salePrice, l.currency)}</b>`);
+  else if (l.currentBid != null) sale.push(`🔨 Current bid ${money(l.currentBid, l.currency)}`);
   if (l.soldAtText) sale.push(`📅 ${esc(l.soldAtText)}`);
   if (sale.length) L.push(sale.join("  ·  "));
+  if (!l.salePrice && l.estimate) L.push(`📊 Est. ${esc(l.estimate)}`);
   if (l.estRetail > 0) L.push(`📈 Est. retail ${money(l.estRetail, l.currency)}`);
 
   // auction / location
-  const loc = [l.auction, [l.city, l.state].filter(Boolean).join(", ") || l.location, l.country]
+  const loc = [l.auction && l.auction.toUpperCase(), [l.city, l.state].filter(Boolean).join(", ") || l.location, l.country]
     .filter(Boolean).map(esc).join(" — ");
   if (loc) L.push(`🏁 ${loc}`);
 
   // specs
   const specs = [];
-  if (l.odometer != null) specs.push(`Odometer: ${esc(fmt(l.odometer))} ${esc(l.odometerUnit)}${l.odometerStatus ? ` (${esc(l.odometerStatus)})` : ""}`);
+  if (l.odometerText) specs.push(`Odometer: ${esc(l.odometerText)}`);
+  else if (l.odometer != null) specs.push(`Odometer: ${esc(fmt(l.odometer))} ${esc(l.odometerUnit)}${l.odometerStatus ? ` (${esc(l.odometerStatus)})` : ""}`);
   const power = [l.engine, l.cylinders && `${esc(l.cylinders)}cyl`, l.fuel, l.transmission, l.drive].filter(Boolean).map(esc).join(" · ");
   if (power) specs.push(power);
   const colors = [l.colorExt, l.colorInt].filter(Boolean).map(esc).join(" / ");
