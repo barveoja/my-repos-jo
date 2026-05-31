@@ -514,7 +514,7 @@ function buildCaption(l) {
   if (title) cond.push(`Title: ${title}`);
   const yn = (v) => (/^(y|yes|true|1)$/i.test(String(v)) ? "Yes" : /^(n|no|false|0)$/i.test(String(v)) ? "No" : esc(String(v)));
   if (l.keys != null) cond.push(`Keys: ${yn(l.keys)}`);
-  if (l.runDrive != null) cond.push(`Run & Drive: ${yn(l.runDrive)}`);
+  if (l.runDrive != null) cond.push(`Start code: ${esc(String(l.runDrive))}`);
   if (cond.length) L.push("\n⚠️ <b>Condition</b>\n• " + cond.join("\n• "));
 
   // identifiers + tags + link
