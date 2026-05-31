@@ -263,31 +263,29 @@ async function viaPlaywright(searchUrl) {
         const isSoldCard = /\bsold\b/i.test(priceText);
         const toNum = (s) => (s ? Number(s.replace(/[^\d]/g, "")) : null);
 
-        // Photos: bid.cars uses a lazy slider — scan <img> attrs, srcset,
-        // data-* lazy URLs, and CSS background-image, not just <img src>.
-        const photoRoot = wrap?.closest("li, .col, .row, [class*='item']")?.parentElement || wrap?.parentElement || wrap;
+        // Photos: scope to THIS lot's carousel only (aria-label="Lot #<id> carousel"),
+        // otherwise we'd grab every card's photos. bid.cars paints slides as
+        // CSS background-image and stores full-size in data-src.
+        const esc = (s) => s.replace(/"/g, '\\"');
+        let gal = document.querySelector(`.carousel-inner[aria-label*="${esc(lotId)}"]`);
+        if (!gal) gal = wrap?.parentElement?.querySelector(".gallery, .carousel-inner") || null;
         const found = new Set();
-        if (photoRoot) {
-          for (const el of photoRoot.querySelectorAll("*")) {
-            if (el.tagName === "IMG") {
-              for (const a of ["src", "data-src", "data-original", "data-lazy", "data-flickity-lazyload", "data-echo"]) {
-                const v = el.getAttribute(a);
-                if (v) found.add(v);
-              }
-              const ss = el.getAttribute("srcset");
-              if (ss) ss.split(",").forEach((p) => found.add(p.trim().split(/\s+/)[0]));
-            }
-            const st = el.getAttribute("style");
-            if (st && /background/i.test(st)) {
-              const m = st.match(/url\((['"]?)(.*?)\1\)/i);
-              if (m && m[2]) found.add(m[2]);
-            }
-            for (const at of el.attributes || []) {
-              if (/^data-/.test(at.name) && /\.(jpe?g|png|webp)/i.test(at.value)) found.add(at.value);
-            }
+        if (gal) {
+          for (const it of gal.querySelectorAll(".carousel-item, [style*='background-image'], img")) {
+            const st = it.getAttribute("style");
+            if (st) { const m = st.match(/url\((['"]?)(.*?)\1\)/i); if (m && m[2]) found.add(m[2]); }
+            const ds = it.getAttribute("data-src") || it.getAttribute("data-thumb-src");
+            if (ds) found.add(ds);
+            if (it.tagName === "IMG") { const s = it.getAttribute("src") || it.getAttribute("data-src"); if (s) found.add(s); }
           }
         }
-        const imgs = [...found].map((u) => (u.startsWith("//") ? "https:" + u : u)).filter(realPhoto);
+        let urls = [...found].map((u) => (u.startsWith("//") ? "https:" + u : u)).filter(realPhoto);
+        // prefer the images.bid.cars host; fall back to pluto if that's all there is
+        const primary = urls.filter((u) => /images\.bid\.cars/i.test(u));
+        urls = primary.length ? primary : urls;
+        // order by trailing photo index (…-N.jpg) and dedupe
+        const idxOf = (u) => { const m = u.match(/-(\d+)\.(?:jpe?g|png|webp)/i); return m ? Number(m[1]) : 999; };
+        const imgs = [...new Set(urls)].sort((a, b) => idxOf(a) - idxOf(b));
 
         // title → year/make/model/series
         const tm = titleText.match(/^(\d{4})\s+([A-Za-z-]+)\s+(.+)$/);
@@ -319,24 +317,7 @@ async function viaPlaywright(searchUrl) {
           estimate: estM ? estM[0] : null,
           images: [...new Set(imgs)],
         };
-        if (!dbg) {
-          const sliderEl = photoRoot?.querySelector("[class*='slider'],[class*='carousel'],[class*='swiper'],[class*='gallery'],[class*='photo'],[class*='image'],figure");
-          let imgHtml = sliderEl ? sliderEl.outerHTML.slice(0, 1500) : null;
-          // also surface any element whose data-* attrs reference a jpg/png/webp
-          let dataAttrHit = null;
-          if (photoRoot) {
-            for (const el of photoRoot.querySelectorAll("*")) {
-              for (const at of el.attributes || []) {
-                if (/\.(jpe?g|png|webp)/i.test(at.value) && !/\/(icons|img\/upd|images)\//i.test(at.value)) {
-                  dataAttrHit = `${el.tagName}.${el.className} [${at.name}]=${at.value.slice(0, 120)}`;
-                  break;
-                }
-              }
-              if (dataAttrHit) break;
-            }
-          }
-          dbg = { photoCount: card.images.length, firstPhoto: card.images[0] || null, dataAttrHit, imgHtml };
-        }
+        if (!dbg) dbg = { photoCount: card.images.length, photos: card.images.slice(0, 3), gallery: gal ? gal.getAttribute("aria-label") : null };
         cards.push(card);
       }
       return { cards, dbg };
