@@ -70,6 +70,13 @@ async function main() {
     raw.push(...got);
   }
 
+  // DEBUG: print the structure of the first scraped object so field mapping can
+  // be matched to the real data. Safe to leave on; remove later if you like.
+  if (raw.length) {
+    console.log("DEBUG raw lot keys:", JSON.stringify(Object.keys(raw[0])));
+    console.log("DEBUG raw lot sample:", JSON.stringify(raw[0]).slice(0, 1800));
+  }
+
   // 2) normalize → keep sold (or trust source) → de-dupe within batch
   const inBatch = new Set();
   const lots = raw
