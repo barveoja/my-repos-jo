@@ -204,23 +204,37 @@ async function viaPlaywright(searchUrl) {
     });
     if (blob) { const l = findLots(blob); if (l.length) return l.slice(0, CFG.resultsPerSource); }
 
-    // Fallback 2: visible cards (adjust selectors to the live markup if needed).
-    const cards = await page.evaluate(() => {
-      const out = [];
-      document.querySelectorAll("[data-lot], .lot-card, .vehicle-card, article").forEach((el) => {
-        const t = (s) => el.querySelector(s)?.textContent?.trim() || null;
-        out.push({
-          title: t("h2, h3, .title"),
-          price: t(".price, .sold, .bid"),
-          lotId: el.getAttribute("data-lot") || el.querySelector("a")?.href,
+    // Fallback 2: visible cards (bid.cars renders results server-side).
+    const result = await page.evaluate(() => {
+      const cards = [];
+      const els = document.querySelectorAll("[data-lot], .lot-card, .vehicle-card, .car-item, article");
+      els.forEach((el) => {
+        const ds = {};
+        for (const k in el.dataset) ds[k] = el.dataset[k]; // all data-* attributes
+        const text = (sel) => el.querySelector(sel)?.textContent?.trim() || null;
+        const imgs = [...el.querySelectorAll("img")]
+          .map((i) =>
+            i.getAttribute("src") || i.getAttribute("data-src") || i.getAttribute("data-original") ||
+            (i.getAttribute("srcset") || "").trim().split(/\s+/)[0])
+          .filter((u) => u && /^https?:/.test(u));
+        cards.push({
+          ...ds, // make/model/year/price/etc. if bid.cars stores them as data-*
+          lotId: el.getAttribute("data-lot") || ds.lot || ds.lotId || null,
+          title: text("h1,h2,h3,h4,.title,.name") || el.querySelector("a[title]")?.getAttribute("title") || null,
+          priceText: text("[class*='price'],[class*='bid'],[class*='sold'],[class*='amount']"),
           url: el.querySelector("a")?.href || null,
-          images: [...el.querySelectorAll("img")].map((i) => i.src).filter(Boolean),
+          images: [...new Set(imgs)],
         });
       });
-      return out;
+      const f = els[0];
+      const debug = f ? { html: f.outerHTML.slice(0, 1800), dataKeys: Object.keys(f.dataset || {}) } : null;
+      return { cards, debug };
     });
-    if (!cards.length) console.warn("Playwright found 0 lots — page may be challenged/blocked on this IP (see README).");
-    return cards;
+    if (result.debug)
+      console.log("DEBUG first card HTML:", JSON.stringify(result.debug));
+    if (!result.cards.length)
+      console.warn("Playwright found 0 lots — page may be challenged/blocked on this IP (see README).");
+    return result.cards;
   } finally {
     await browser.close();
   }
@@ -296,7 +310,7 @@ function normalizeLot(r) {
   if (!id) return null;
 
   const status = String(pick(r, ["status", "auctionStatus", "saleStatus", "lotStatus"]) || "").toLowerCase();
-  const salePrice = num(pick(r, ["salePrice", "soldPrice", "finalBid", "purchasePrice", "price", "currentBid", "highBid"]));
+  const salePrice = num(pick(r, ["salePrice", "soldPrice", "finalBid", "purchasePrice", "price", "currentBid", "highBid", "priceText"]));
   const soldRaw = pick(r, ["saleDate", "soldDate", "sale_date", "auctionDate", "dateSold", "saleDateTime"]);
   const soldAtTs = toTs(soldRaw);
   const isSold = /sold|purchas/.test(status) || (salePrice > 0 && soldAtTs > 0);
