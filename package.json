@@ -1,0 +1,16 @@
+{
+  "name": "bidcars-telegram-bot-github",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub-Actions-only bid.cars → Telegram channel bot",
+  "scripts": {
+    "start": "node bot.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.49.0"
+  }
+}
