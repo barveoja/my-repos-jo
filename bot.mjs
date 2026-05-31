@@ -204,34 +204,54 @@ async function viaPlaywright(searchUrl) {
     });
     if (blob) { const l = findLots(blob); if (l.length) return l.slice(0, CFG.resultsPerSource); }
 
-    // Fallback 2: visible cards (bid.cars renders results server-side).
+    // Fallback 2: bid.cars renders results server-side. The `data-lot` attribute
+    // lives on the "favorite" heart button INSIDE each card, so we anchor on that
+    // and walk up to the enclosing card to read title/price/image/link.
     const result = await page.evaluate(() => {
+      const hearts = [...document.querySelectorAll("a[data-lot]")];
+      const isLotHref = (h) => h && h !== "#" && !h.endsWith("#") && /lot|vin|\/\d{5,}/i.test(h);
+      const findCard = (heart) => {
+        let n = heart;
+        for (let i = 0; i < 9 && n && n.parentElement; i++) {
+          n = n.parentElement;
+          const hasImg = !!n.querySelector("img");
+          const hasLotLink = [...n.querySelectorAll("a")].some((a) => isLotHref(a.getAttribute("href")));
+          if (hasImg && hasLotLink) return n;
+        }
+        return heart.parentElement;
+      };
+      const seen = new Set();
       const cards = [];
-      const els = document.querySelectorAll("[data-lot], .lot-card, .vehicle-card, .car-item, article");
-      els.forEach((el) => {
-        const ds = {};
-        for (const k in el.dataset) ds[k] = el.dataset[k]; // all data-* attributes
-        const text = (sel) => el.querySelector(sel)?.textContent?.trim() || null;
-        const imgs = [...el.querySelectorAll("img")]
-          .map((i) =>
-            i.getAttribute("src") || i.getAttribute("data-src") || i.getAttribute("data-original") ||
-            (i.getAttribute("srcset") || "").trim().split(/\s+/)[0])
-          .filter((u) => u && /^https?:/.test(u));
+      let debugHtml = null;
+      for (const heart of hearts) {
+        const lot = heart.getAttribute("data-lot");
+        if (!lot || seen.has(lot)) continue;
+        seen.add(lot);
+        const card = findCard(heart);
+        if (!debugHtml && card) debugHtml = card.outerHTML.slice(0, 3000);
+        const text = (sel) => card?.querySelector(sel)?.textContent?.trim() || null;
+        const lotLink = card
+          ? [...card.querySelectorAll("a")].find((a) => isLotHref(a.getAttribute("href")))
+          : null;
+        const imgs = card
+          ? [...card.querySelectorAll("img")]
+              .map((i) =>
+                i.getAttribute("src") || i.getAttribute("data-src") || i.getAttribute("data-original") ||
+                (i.getAttribute("srcset") || "").trim().split(/\s+/)[0])
+              .filter((u) => u && /^https?:/.test(u))
+          : [];
         cards.push({
-          ...ds, // make/model/year/price/etc. if bid.cars stores them as data-*
-          lotId: el.getAttribute("data-lot") || ds.lot || ds.lotId || null,
-          title: text("h1,h2,h3,h4,.title,.name") || el.querySelector("a[title]")?.getAttribute("title") || null,
+          lotId: lot,
+          title: text("h1,h2,h3,h4,.title,.name,.lot-title") || lotLink?.textContent?.trim() || null,
           priceText: text("[class*='price'],[class*='bid'],[class*='sold'],[class*='amount']"),
-          url: el.querySelector("a")?.href || null,
+          allText: card ? card.innerText.replace(/\s+/g, " ").trim().slice(0, 400) : null,
+          url: lotLink?.href || null,
           images: [...new Set(imgs)],
         });
-      });
-      const f = els[0];
-      const debug = f ? { html: f.outerHTML.slice(0, 1800), dataKeys: Object.keys(f.dataset || {}) } : null;
-      return { cards, debug };
+      }
+      return { cards, debugHtml };
     });
-    if (result.debug)
-      console.log("DEBUG first card HTML:", JSON.stringify(result.debug));
+    console.log("DEBUG card container HTML:", JSON.stringify(result.debugHtml));
     if (!result.cards.length)
       console.warn("Playwright found 0 lots — page may be challenged/blocked on this IP (see README).");
     return result.cards;
@@ -319,6 +339,7 @@ function normalizeLot(r) {
     id,
     isSold,
     soldAtTs,
+    title: String(pick(r, ["title", "name", "vehicleTitle"]) || (r.allText ? r.allText.slice(0, 80) : "")).trim() || null,
     soldAtText: typeof soldRaw === "string" ? soldRaw : soldAtTs ? new Date(soldAtTs).toISOString().slice(0, 10) : null,
     salePrice,
     currency: pick(r, ["currency", "currencyCode"]) || "USD",
