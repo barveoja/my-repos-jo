@@ -42,10 +42,16 @@ jobs:
         run: |
           echo "IP before VPN: $(curl -s --max-time 15 https://api.ipify.org || echo unknown)"
           sudo apt-get update -qq
-          sudo apt-get install -y -qq wireguard-tools openresolv
+          sudo apt-get install -y -qq wireguard-tools
           umask 077
-          printf '%s\n' "$WG_CONF" | sudo tee /etc/wireguard/wg0.conf > /dev/null
+          # Write the config WITHOUT any DNS= line. wg-quick would need a
+          # resolvconf provider (not reliably installable on the runner); we set
+          # DNS ourselves below, which also works for full-tunnel routing.
+          printf '%s\n' "$WG_CONF" | grep -vi '^[[:space:]]*DNS' | sudo tee /etc/wireguard/wg0.conf > /dev/null
           sudo wg-quick up wg0
+          # Use a public resolver reachable through the tunnel.
+          sudo rm -f /etc/resolv.conf
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/resolv.conf > /dev/null
           echo "IP after VPN:  $(curl -s --max-time 15 https://api.ipify.org || echo unknown)"
 
       - name: Run bot
