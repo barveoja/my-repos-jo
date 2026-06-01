@@ -134,7 +134,8 @@ async function main() {
   // 5) diagnose WHY this run looked the way it did, and report it.
   let reason;
   if (DIAG.blocked) reason = "🚫 BLOCKED: bid.cars served a challenge/captcha on this IP — no usable results. Consider the VPN (USE_VPN) or rotating the exit IP.";
-  else if (raw.length === 0) reason = "⚠️ Scrape returned 0 lots (page structure changed or soft-blocked). Check the run log.";
+  else if (raw.length === 0 && DIAG.emptyResults) reason = "ℹ️ bid.cars returned a 'no results' page for this query/IP (not blocked). Try a different SEARCH_URLS or IP.";
+  else if (raw.length === 0) reason = `⚠️ Page loaded (status 200, no challenge) but 0 result cards appeared — soft-empty or the internal results API was slow/empty this run. Often transient; next run usually recovers. (lot links seen: ${DIAG.cardLinks ?? 0})`;
   else if (lots.length === 0) reason = `ℹ️ ${raw.length} lots scraped but none passed the filter (TRUST_SOURCE_FILTER=${CFG.trustSource}).`;
   else if (fresh.length === 0) reason = `✅ Working — but all ${lots.length} current lots were already posted (dedupe). No new lots this run.`;
   else if (posted === 0) reason = `⚠️ ${fresh.length} fresh lots but 0 posted — Telegram send errors (see log).`;
@@ -144,6 +145,7 @@ async function main() {
   const summary =
     `bid.cars bot run\n${reason}\n\n` +
     `exit IP: ${DIAG.exitIp || "?"}\n` +
+    `lot links on page: ${DIAG.cardLinks ?? "—"}\n` +
     `sources: ${DIAG.sources.map((s) => s.count).join(", ") || "—"}\n` +
     `scraped=${raw.length} candidates=${lots.length} fresh=${fresh.length} posted=${posted}\n` +
     `seen state=${Object.keys(seen).length}` +
@@ -253,12 +255,42 @@ async function viaPlaywright(searchUrl) {
       console.warn(`BLOCK DETECTED — status=${httpStatus}, title="${probe.title.slice(0, 80)}". bid.cars likely served a challenge on this IP.`);
     }
 
-    // Scroll to trigger lazy/paginated XHR until we have enough.
-    for (let i = 0; i < 8 && captured.length < CFG.resultsPerSource; i++) {
-      await page.mouse.wheel(0, 5000);
-      await page.waitForTimeout(1500);
+    // The result cards are injected after an internal /app/search/request call,
+    // so don't parse on a fixed timer — wait until the lot links actually exist,
+    // and reload once if the first attempt comes back empty (transient soft-empty).
+    const CARD_SEL = 'a.item-title[href*="/lot/"], a[href*="/en/lot/"]';
+    const countCards = async () => page.evaluate((s) => document.querySelectorAll(s).length, CARD_SEL).catch(() => 0);
+    let cardCount = 0;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      await page.waitForSelector(CARD_SEL, { timeout: 25000 }).catch(() => {});
+      // nudge lazy content + give the injected list a moment to fill in
+      for (let i = 0; i < 6; i++) {
+        await page.mouse.wheel(0, 5000);
+        await page.waitForTimeout(1200);
+        if ((await countCards()) > 0) break;
+      }
+      cardCount = await countCards();
+      console.log(`attempt ${attempt}: ${cardCount} lot links on page`);
+      if (cardCount > 0 || captured.length) break;
+      if (attempt === 1) {
+        console.warn("0 lot links — reloading once and retrying…");
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 }).catch(() => {});
+        await page.waitForTimeout(2500);
+      }
     }
-    await page.waitForLoadState("networkidle", { timeout: 15000 }).catch(() => {});
+    DIAG.cardLinks = cardCount;
+    await page.waitForLoadState("networkidle", { timeout: 10000 }).catch(() => {});
+
+    // Distinguish "site said no results" from "nothing rendered" for diagnostics.
+    if (cardCount === 0 && !captured.length) {
+      const emptyMsg = await page.evaluate(() =>
+        /nothing was found|no results|0 results|unfortunately/i.test(document.body ? document.body.innerText : "")
+      ).catch(() => false);
+      DIAG.emptyResults = emptyMsg;
+      console.warn(emptyMsg
+        ? "bid.cars returned a 'no results' page for this query/IP."
+        : "Page loaded but no result cards appeared (soft-empty or slow internal API).");
+    }
 
     if (captured.length) return dedupeById(captured).slice(0, CFG.resultsPerSource);
 
