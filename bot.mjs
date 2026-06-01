@@ -43,12 +43,28 @@ const CFG = {
   dedupeDays: int(E.DEDUPE_DAYS, 90),
   trustSource: String(E.TRUST_SOURCE_FILTER || "").toLowerCase() === "true",
   photoMode: (E.PHOTO_MODE || "auto").toLowerCase(),
+  alertEveryRun: String(E.ALERT_EVERY_RUN || "").toLowerCase() === "true",
 };
 const API = `https://api.telegram.org/bot${CFG.botToken}`;
 const STATE_FILE = "state/seen.json";
 const HEARTBEAT_FILE = "state/heartbeat.txt";
 const UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36";
+
+// Run-wide diagnostics, filled as we go, summarized at the end.
+const DIAG = { exitIp: null, sources: [], blocked: false, errors: [] };
+
+// Send a short message to the alert DM (best-effort; never throws).
+async function notify(text) {
+  if (!CFG.alertChat || !CFG.botToken) return;
+  try {
+    await fetch(`${API}/sendMessage`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: CFG.alertChat, text, disable_web_page_preview: true }),
+    });
+  } catch {}
+}
 
 function req(k) {
   if (!E[k]) throw new Error(`Missing required secret/var: ${k}`);
@@ -65,7 +81,14 @@ async function main() {
   // 1) scrape every source
   let raw = [];
   for (const url of CFG.searchUrls) {
-    const got = CFG.mode === "playwright" ? await viaPlaywright(url) : await viaApify(url);
+    let got = [];
+    try {
+      got = CFG.mode === "playwright" ? await viaPlaywright(url) : await viaApify(url);
+    } catch (e) {
+      DIAG.errors.push(`scrape ${url.slice(0, 60)}: ${String(e).slice(0, 160)}`);
+      console.error(`scrape failed (${url.slice(0, 60)}):`, String(e));
+    }
+    DIAG.sources.push({ url, count: got.length });
     console.log(`source → ${got.length} lots  (${url})`);
     raw.push(...got);
   }
@@ -107,6 +130,29 @@ async function main() {
   await saveSeen(seen);
   await heartbeat();
   console.log(`posted=${posted}  state size=${Object.keys(seen).length}`);
+
+  // 5) diagnose WHY this run looked the way it did, and report it.
+  let reason;
+  if (DIAG.blocked) reason = "🚫 BLOCKED: bid.cars served a challenge/captcha on this IP — no usable results. Consider the VPN (USE_VPN) or rotating the exit IP.";
+  else if (raw.length === 0) reason = "⚠️ Scrape returned 0 lots (page structure changed or soft-blocked). Check the run log.";
+  else if (lots.length === 0) reason = `ℹ️ ${raw.length} lots scraped but none passed the filter (TRUST_SOURCE_FILTER=${CFG.trustSource}).`;
+  else if (fresh.length === 0) reason = `✅ Working — but all ${lots.length} current lots were already posted (dedupe). No new lots this run.`;
+  else if (posted === 0) reason = `⚠️ ${fresh.length} fresh lots but 0 posted — Telegram send errors (see log).`;
+  else reason = `✅ Posted ${posted} of ${fresh.length} new lot(s).`;
+  console.log(`RESULT: ${reason}`);
+
+  const summary =
+    `bid.cars bot run\n${reason}\n\n` +
+    `exit IP: ${DIAG.exitIp || "?"}\n` +
+    `sources: ${DIAG.sources.map((s) => s.count).join(", ") || "—"}\n` +
+    `scraped=${raw.length} candidates=${lots.length} fresh=${fresh.length} posted=${posted}\n` +
+    `seen state=${Object.keys(seen).length}` +
+    (DIAG.errors.length ? `\nerrors:\n• ${DIAG.errors.slice(0, 5).join("\n• ")}` : "");
+
+  // Ping the alert DM on anything noteworthy (block, zero results, errors,
+  // or an actual post). Quiet dedupe-only runs stay silent unless ALERT_EVERY_RUN.
+  const noteworthy = DIAG.blocked || raw.length === 0 || lots.length === 0 || DIAG.errors.length > 0 || posted > 0;
+  if (CFG.alertEveryRun || noteworthy) await notify(summary);
 }
 
 // ── data sources ─────────────────────────────────────────────────────────
@@ -166,6 +212,13 @@ async function viaPlaywright(searchUrl) {
 
     const page = await ctx.newPage();
 
+    // Diagnostics: what IP is bid.cars actually seeing us from?
+    try {
+      DIAG.exitIp = await page.evaluate(() =>
+        fetch("https://api.ipify.org").then((r) => r.text()).catch(() => null)
+      );
+    } catch {}
+
     // Capture every JSON response and keep the lot-shaped objects.
     page.on("response", async (res) => {
       try {
@@ -181,8 +234,24 @@ async function viaPlaywright(searchUrl) {
       } catch {}
     });
 
-    await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    const resp = await page.goto(searchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    const httpStatus = resp ? resp.status() : 0;
     await page.waitForTimeout(2500);
+
+    // Block / challenge detection: HTTP status + tell-tale page markers.
+    const probe = await page.evaluate(() => ({
+      title: document.title || "",
+      bodyHead: (document.body ? document.body.innerText : "").slice(0, 400),
+      html: document.documentElement.outerHTML.slice(0, 4000),
+    }));
+    const blockMarkers =
+      /just a moment|attention required|checking your browser|verify you are human|cf-chl|cf-challenge|access denied|captcha|cloudflare|enable javascript and cookies/i;
+    const isBlocked = httpStatus === 403 || httpStatus === 429 || blockMarkers.test(probe.title) || blockMarkers.test(probe.bodyHead);
+    console.log(`page status=${httpStatus} title="${probe.title.slice(0, 80)}" exitIp=${DIAG.exitIp || "?"}`);
+    if (isBlocked) {
+      DIAG.blocked = true;
+      console.warn(`BLOCK DETECTED — status=${httpStatus}, title="${probe.title.slice(0, 80)}". bid.cars likely served a challenge on this IP.`);
+    }
 
     // Scroll to trigger lazy/paginated XHR until we have enough.
     for (let i = 0; i < 8 && captured.length < CFG.resultsPerSource; i++) {
@@ -324,7 +393,11 @@ async function viaPlaywright(searchUrl) {
     });
     console.log("DEBUG parse sample:", JSON.stringify(result.dbg));
     if (!result.cards.length)
-      console.warn("Playwright found 0 lots — page may be challenged/blocked on this IP (see README).");
+      console.warn(
+        isBlocked
+          ? "0 lots — page was a challenge/block (see BLOCK DETECTED above)."
+          : "0 lots — no challenge detected, so bid.cars' page structure likely changed. Inspect the run log."
+      );
     return result.cards;
   } finally {
     await browser.close();
