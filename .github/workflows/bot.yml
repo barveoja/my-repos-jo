@@ -17,7 +17,7 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -73,6 +73,8 @@ jobs:
           DEDUPE_DAYS: ${{ vars.DEDUPE_DAYS }}
           TRUST_SOURCE_FILTER: ${{ vars.TRUST_SOURCE_FILTER }}
           PHOTO_MODE: ${{ vars.PHOTO_MODE }}
+          RUN_BUDGET_MS: ${{ vars.RUN_BUDGET_MS }}
+          ALERT_EVERY_RUN: ${{ vars.ALERT_EVERY_RUN }}
         run: node bot.mjs
 
       # Drop the tunnel before the git push so repo writes use GitHub's normal IP.
