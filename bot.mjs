@@ -44,7 +44,13 @@ const CFG = {
   trustSource: String(E.TRUST_SOURCE_FILTER || "").toLowerCase() === "true",
   photoMode: (E.PHOTO_MODE || "auto").toLowerCase(),
   alertEveryRun: String(E.ALERT_EVERY_RUN || "").toLowerCase() === "true",
+  maxRunMs: int(E.RUN_BUDGET_MS, 12 * 60 * 1000), // stop posting after this, then finalize cleanly
 };
+
+// Telegram flood-control tracking. Once Telegram starts 429'ing, retrying just
+// extends the flood wait, so we back off and finish the rest next run.
+let FLOOD_ABORT = false;
+let floodHits = 0;
 const API = `https://api.telegram.org/bot${CFG.botToken}`;
 const STATE_FILE = "state/seen.json";
 const HEARTBEAT_FILE = "state/heartbeat.txt";
@@ -113,8 +119,12 @@ async function main() {
   console.log(`raw=${raw.length} candidates=${lots.length} fresh=${fresh.length}`);
 
   let posted = 0;
+  let stop = null; // why we stopped early, if at all
+  const START = Date.now();
   for (const lot of fresh) {
-    if (posted >= CFG.maxPostsPerRun) break;
+    if (posted >= CFG.maxPostsPerRun) { stop = "post cap"; break; }
+    if (FLOOD_ABORT) { stop = "flood"; break; }
+    if (Date.now() - START > CFG.maxRunMs) { stop = "time budget"; break; }
     try {
       await postLot(lot);
       seen[lot.id] = Date.now();
@@ -122,8 +132,11 @@ async function main() {
       if (posted < CFG.maxPostsPerRun) await sleep(CFG.postDelayMs);
     } catch (e) {
       console.error(`post failed ${lot.id}:`, String(e));
+      DIAG.errors.push(`post ${lot.id}: ${String(e).slice(0, 120)}`);
+      if (FLOOD_ABORT) { stop = "flood"; break; }
     }
   }
+  DIAG.stop = stop;
 
   // 4) prune old ids + persist state (+ daily heartbeat)
   prune(seen, CFG.dedupeDays);
@@ -138,7 +151,11 @@ async function main() {
   else if (raw.length === 0) reason = `⚠️ Page loaded (status 200, no challenge) but 0 result cards appeared — soft-empty or the internal results API was slow/empty this run. Often transient; next run usually recovers. (lot links seen: ${DIAG.cardLinks ?? 0})`;
   else if (lots.length === 0) reason = `ℹ️ ${raw.length} lots scraped but none passed the filter (TRUST_SOURCE_FILTER=${CFG.trustSource}).`;
   else if (fresh.length === 0) reason = `✅ Working — but all ${lots.length} current lots were already posted (dedupe). No new lots this run.`;
-  else if (posted === 0) reason = `⚠️ ${fresh.length} fresh lots but 0 posted — Telegram send errors (see log).`;
+  else if (posted === 0 && DIAG.stop === "flood") reason = "🚦 Telegram FLOOD CONTROL — 0 posted this run. Lower MAX_POSTS_PER_RUN (~20) and raise POST_DELAY_MS (~5000). Unposted lots stay queued for next run.";
+  else if (posted === 0) reason = `⚠️ ${fresh.length} fresh lots but 0 posted — send errors (see log).`;
+  else if (DIAG.stop === "flood") reason = `🚦 Posted ${posted} then hit Telegram flood control. Remaining ${fresh.length - posted} will post next run.`;
+  else if (DIAG.stop === "time budget") reason = `⏱ Posted ${posted}; stopped at the time budget. Remaining ${fresh.length - posted} will post next run.`;
+  else if (DIAG.stop === "post cap") reason = `✅ Posted ${posted} (hit MAX_POSTS_PER_RUN). Remaining ${fresh.length - posted} will post next run.`;
   else reason = `✅ Posted ${posted} of ${fresh.length} new lot(s).`;
   console.log(`RESULT: ${reason}`);
 
@@ -718,10 +735,17 @@ async function postForm(method, form, attempt = 0) {
 async function handleTg(method, res, retry, attempt) {
   const data = await res.json().catch(() => ({}));
   if (data.ok) return data;
-  if (res.status === 429 && attempt < 5) {
-    const wait = ((data?.parameters?.retry_after ?? 2 ** attempt) + 1) * 1000;
-    console.warn(`429 on ${method}; waiting ${wait}ms`);
-    await sleep(wait);
+  if (res.status === 429) {
+    const ra = data?.parameters?.retry_after ?? 2 ** attempt;
+    floodHits++;
+    console.warn(`429 on ${method}; retry_after=${ra}s (floodHits=${floodHits})`);
+    // A large retry_after means Telegram is in flood-wait — don't sit through it;
+    // stop now and let the next scheduled run continue (unposted lots stay fresh).
+    if (ra > 10 || floodHits >= 3 || attempt >= 1) {
+      FLOOD_ABORT = true;
+      throw new Error(`Telegram flood control on ${method} (429, retry_after=${ra}s). Backing off; will resume next run.`);
+    }
+    await sleep((ra + 1) * 1000); // small, transient limit — brief retry
     return retry();
   }
   if (res.status >= 500 && attempt < 3) { await sleep(1500 * (attempt + 1)); return retry(); }
