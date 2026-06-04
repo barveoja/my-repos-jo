@@ -665,7 +665,9 @@ async function postLot(lot) {
       await sendByUrl(photos, caption);
       return;
     } catch (e) {
-      if (mode === "url") throw e;
+      // A flood/rate-limit is not a URL problem — don't waste time re-uploading
+      // (bid.cars also 403s direct image fetches). Propagate so the run backs off.
+      if (mode === "url" || FLOOD_ABORT || /flood|429/i.test(String(e))) throw e;
       console.warn(`URL post failed (${String(e).slice(0, 120)}), retrying via upload…`);
     }
   }
@@ -738,15 +740,22 @@ async function handleTg(method, res, retry, attempt) {
   if (res.status === 429) {
     const ra = data?.parameters?.retry_after ?? 2 ** attempt;
     floodHits++;
-    console.warn(`429 on ${method}; retry_after=${ra}s (floodHits=${floodHits})`);
-    // A large retry_after means Telegram is in flood-wait — don't sit through it;
-    // stop now and let the next scheduled run continue (unposted lots stay fresh).
-    if (ra > 10 || floodHits >= 3 || attempt >= 1) {
+    // A genuinely long backoff = real flood-wait → stop and resume next run.
+    if (ra > 60) {
       FLOOD_ABORT = true;
-      throw new Error(`Telegram flood control on ${method} (429, retry_after=${ra}s). Backing off; will resume next run.`);
+      throw new Error(`Telegram deep flood-wait (${ra}s) on ${method}; resuming next run.`);
     }
-    await sleep((ra + 1) * 1000); // small, transient limit — brief retry
-    return retry();
+    // Small/normal pacing limits (e.g. retry_after 1–30s): just honor them and
+    // retry the SAME message a few times. These are routine and not a reason to abort.
+    if (attempt < 6) {
+      const wait = (ra + 1) * 1000;
+      console.warn(`429 on ${method}; retry_after=${ra}s — waiting ${ra + 1}s (attempt ${attempt + 1}/6)`);
+      await sleep(wait);
+      return retry();
+    }
+    // Same message keeps getting limited after several waits → treat as stuck.
+    FLOOD_ABORT = true;
+    throw new Error(`Telegram 429 persisted on ${method} after ${attempt} retries; resuming next run.`);
   }
   if (res.status >= 500 && attempt < 3) { await sleep(1500 * (attempt + 1)); return retry(); }
   throw new Error(`Telegram ${method} ${res.status}: ${JSON.stringify(data).slice(0, 300)}`);
